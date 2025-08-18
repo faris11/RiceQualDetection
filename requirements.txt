@@ -1,5 +1,5 @@
 streamlit==1.22.0
-numpy==1.24.3
+numpy>=2.1
 opencv-python==4.7.0.72
-tensorflow==2.12.0
+tensorflow==<a recent version that supports Py3.13>
 Pillow==9.5.0
