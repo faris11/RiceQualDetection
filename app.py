@@ -171,29 +171,29 @@ def is_rice_image(image):
 
 
 # Main function for prediction
-'''def predict_rice_quality(image):
+#def predict_rice_quality(image):
     # Load model
-    model = load_model()
-    if model is None:
-        return None
+    #model = load_model()
+    #if model is None:
+    #    return None
     
     # Preprocess image
-    processed_img = preprocess_image(image)
+    #processed_img = preprocess_image(image)
     
     # Make prediction
-    prediction = model.predict(processed_img)
+    #prediction = model.predict(processed_img)
     
     # Get class with highest probability
-    class_idx = np.argmax(prediction[0])
+    #class_idx = np.argmax(prediction[0])
     
     # Map index to class name
-    class_names = ["normal", "damage", "chalky", "broken", "discolored"]
-    predicted_class = class_names[class_idx]
+    #class_names = ["normal", "damage", "chalky", "broken", "discolored"]
+    #predicted_class = class_names[class_idx]
     
     # Get confidence score
-    confidence = float(prediction[0][class_idx])
+    #confidence = float(prediction[0][class_idx])
     
-    return predicted_class, confidence'''
+    #return predicted_class, confidence
 
 #Read model from PyTorch
 def predict_rice_quality(image):
@@ -296,4 +296,5 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
