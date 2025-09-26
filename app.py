@@ -5,6 +5,10 @@ import tensorflow as tf
 from PIL import Image
 import io
 import os
+import torch
+import torch.nn.functional as F
+import numpy as np
+from torchvision import transforms
 
 # Set page configuration
 st.set_page_config(
@@ -167,7 +171,7 @@ def is_rice_image(image):
 
 
 # Main function for prediction
-def predict_rice_quality(image):
+'''def predict_rice_quality(image):
     # Load model
     model = load_model()
     if model is None:
@@ -189,7 +193,34 @@ def predict_rice_quality(image):
     # Get confidence score
     confidence = float(prediction[0][class_idx])
     
+    return predicted_class, confidence'''
+
+#Read model from PyTorch
+def predict_rice_quality(image):
+    # Load PyTorch model
+    model = torch.load("model.pth", map_location=torch.device("cpu"))
+    model.eval()
+
+    # Preprocess image (contoh, sesuaikan dengan training)
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+    processed_img = preprocess(image).unsqueeze(0)  # add batch dim
+
+    with torch.no_grad():
+        output = model(processed_img)
+        prediction = F.softmax(output, dim=1)  # convert to probabilities
+        class_idx = torch.argmax(prediction, dim=1).item()
+        confidence = prediction[0][class_idx].item()
+
+    class_names = ["normal", "damage", "chalky", "broken", "discolored"]
+    predicted_class = class_names[class_idx]
+
     return predicted_class, confidence
+
 
 # Create a file uploader widget
 st.markdown("<div class='upload-box'>", unsafe_allow_html=True)
@@ -265,3 +296,4 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
