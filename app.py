@@ -140,7 +140,7 @@ def is_rice_image(image):
 
     # Normalize by image area (scale-invariant)
     area_ratio = area / img_area  # expected ~0.002–0.2 depending on crop
-    if not (0.002 <= area_ratio <= 0.25):
+    if not (0.002 <= area_ratio <= 0.3):
         return False
 
     # Shape: elongated, compact, convex-ish
@@ -149,7 +149,7 @@ def is_rice_image(image):
     if w == 0 or h == 0:
         return False
     aspect = max(w, h) / min(w, h)  # rice is elongated
-    if not (1.8 <= aspect <= 10.0):
+    if not (1.5 <= aspect <= 10.0):
         return False
 
     # Solidity: area / convex hull area (should be high)
@@ -296,5 +296,6 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
