@@ -198,7 +198,7 @@ def is_rice_image(image):
 #Read model from PyTorch
 def predict_rice_quality(image):
     # Load PyTorch model
-    model = torch.load("model.pth", map_location=torch.device("cpu"))
+    model = torch.load("model/efficientnet_cbam_6.pth", map_location=torch.device("cpu"))
     model.eval()
 
     # Preprocess image (contoh, sesuaikan dengan training)
@@ -296,6 +296,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
