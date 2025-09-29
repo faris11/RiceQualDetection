@@ -58,6 +58,11 @@ try:
     setattr(sys.modules[__name__], 'EfficientNetWithCBAM', _EfficientNetWithCBAM)
 except Exception:
     pass
+
+# Konfigurasi model
+MODEL_PATH = "model/efficientnet_cbam_6.pth"   # ganti sesuai lokasi .pth Anda
+NUM_CLASSES = 5
+CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
     
 # Function to load the model
 @st.cache_resource(show_spinner=False)
@@ -314,6 +319,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
