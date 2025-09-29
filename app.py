@@ -53,17 +53,39 @@ st.markdown("""
 st.markdown("<h1 class='header'>Rice Quality Detection</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; margin-bottom: 2rem;'>Upload an image of rice to detect its quality.</p>", unsafe_allow_html=True)
 
+try:
+    from models.efficientnet_cbam import EfficientNetWithCBAM as _EfficientNetWithCBAM
+    setattr(sys.modules[__name__], 'EfficientNetWithCBAM', _EfficientNetWithCBAM)
+except Exception:
+    pass
+    
 # Function to load the model
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_model():
-    # Replace this with the actual path to your saved model
-    model_path = "model/rice_quality_model.h5"
-    if os.path.exists(model_path):
-        model = tf.keras.models.load_model(model_path)
-        return model
-    else:
-        st.error(f"Model not found at {model_path}. Please ensure the model file exists.")
+    if not os.path.exists(MODEL_PATH):
+        st.error(f"Model not found at {MODEL_PATH}")
         return None
+    try:
+        model = torch.load(MODEL_PATH, map_location="cpu")  # unpickle full model
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError("Loaded object is not an nn.Module. Did you save a state_dict instead?")
+        model.eval()
+        return model
+    except Exception as e:
+        st.error(
+            "Gagal memuat FULL model (.pth). "
+            "Jika error bertuliskan `Can't get attribute 'EfficientNetWithCBAM'`, "
+            "pastikan kelas tersebut di-import/terdefinisi di file ini. "
+            f"Detail: {e}"
+        )
+        return None
+        
+_preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
 
 # Function to preprocess the image
 def preprocess_image(image, target_size=(224, 224)):
@@ -197,30 +219,26 @@ def is_rice_image(image):
 
 #Read model from PyTorch
 def predict_rice_quality(image):
-    # Load PyTorch model
-    model = torch.load("model/efficientnet_cbam_6.pth", map_location=torch.device("cpu"))
-    model.eval()
+    model = load_model()
+    if model is None:
+        return None
 
-    # Preprocess image (contoh, sesuaikan dengan training)
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    processed_img = preprocess(image).unsqueeze(0)  # add batch dim
+    pil_img = _to_pil_rgb(image)
+    x = _preprocess(pil_img).unsqueeze(0)  # [1,C,H,W]
 
     with torch.no_grad():
-        output = model(processed_img)
-        prediction = F.softmax(output, dim=1)  # convert to probabilities
-        class_idx = torch.argmax(prediction, dim=1).item()
-        confidence = prediction[0][class_idx].item()
+        logits = model(x)
+        if logits.ndim != 2 or logits.size(1) != NUM_CLASSES:
+            raise RuntimeError(
+                f"Model output shape {tuple(logits.shape)} tidak sesuai NUM_CLASSES={NUM_CLASSES}. "
+                "Pastikan checkpoint & arsitektur sama."
+            )
+        probs = F.softmax(logits, dim=1)
+        idx = int(torch.argmax(probs, dim=1).item())
+        conf = float(probs[0, idx].item())
 
-    class_names = ["normal", "damage", "chalky", "broken", "discolored"]
-    predicted_class = class_names[class_idx]
-
-    return predicted_class, confidence
-
+    label = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else str(idx)
+    return label, conf
 
 # Create a file uploader widget
 st.markdown("<div class='upload-box'>", unsafe_allow_html=True)
@@ -296,6 +314,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
