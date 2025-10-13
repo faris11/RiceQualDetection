@@ -133,7 +133,7 @@ except Exception:
     pass
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(APP_DIR, "model", "efficientnet_cbam_6.pth")  # sesuaikan nama file
+MODEL_PATH = os.path.join(APP_DIR, "model", "efficientnet_cbam_6 (1).pth")  # sesuaikan nama file
 
 def _check_model_file(path):
     if not os.path.exists(path):
@@ -494,6 +494,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
