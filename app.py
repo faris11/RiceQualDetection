@@ -1,7 +1,5 @@
 import os
-import io
 import sys
-import time
 import cv2
 import shutil
 import pickle
@@ -52,12 +50,65 @@ st.markdown("<p style='text-align: center; margin-bottom: 2rem;'>Upload an image
 NUM_CLASSES = 5
 CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
 
+# ============================
+# === Global Config & Paths ==
+# ============================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(APP_DIR, "model")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+def _get_secret_like(keys, default=""):
+    """Ambil dari st.secrets root, table [model]/[MODEL], atau ENV."""
+    val = None
+    for k in keys:
+        # root
+        try:
+            v = st.secrets[k]
+            if isinstance(v, str):
+                val = v
+                break
+        except Exception:
+            pass
+        # table
+        try:
+            tbl = st.secrets.get("model", {}) or st.secrets.get("MODEL", {})
+            if isinstance(tbl, dict) and k in tbl and isinstance(tbl[k], str):
+                val = tbl[k]
+                break
+        except Exception:
+            pass
+        # env
+        v = os.environ.get(k)
+        if v is not None:
+            val = v
+            break
+    return (val.strip() if isinstance(val, str) else default)
+
+MODEL_URL        = _get_secret_like(["MODEL_URL"], "")
+GDRIVE_FILE_ID   = _get_secret_like(["GDRIVE_FILE_ID", "GOOGLE_DRIVE_FILE_ID"], "")
+LOCAL_MODEL_NAME = _get_secret_like(["LOCAL_MODEL_NAME"], "rice_model.ts")  # .ts/.pt (TorchScript) atau .pth (state_dict/FULL)
+EFFNET_VER       = _get_secret_like(["EFFNET_VER"], "b0").lower()           # b0/b1/b2/b3
+
+LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, LOCAL_MODEL_NAME)
+
+with st.expander("⚙️ Model config (debug aman)"):
+    dbg = {
+        "has_MODEL_URL": bool(MODEL_URL),
+        "has_GDRIVE_FILE_ID": bool(GDRIVE_FILE_ID),
+        "LOCAL_MODEL_NAME": LOCAL_MODEL_NAME,
+        "EFFNET_VER": EFFNET_VER,
+        "MODEL_DIR_exists": os.path.isdir(MODEL_DIR),
+        "LOCAL_MODEL_exists": os.path.isfile(LOCAL_MODEL_PATH),
+        "LOCAL_MODEL_size_bytes": os.path.getsize(LOCAL_MODEL_PATH) if os.path.isfile(LOCAL_MODEL_PATH) else 0,
+    }
+    st.code(dbg, language="python")
+
 # ===================================
-# === Model Architecture (VGG+CBAM) ==
+# === CBAM building blocks & model ===
 # ===================================
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
-        super().__init__()
+        super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
@@ -67,11 +118,13 @@ class ChannelAttention(nn.Module):
     def forward(self, x):
         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        return self.sigmoid(avg_out + max_out)
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
-        super().__init__()
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
         padding = 3 if kernel_size == 7 else 1
         self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
         self.sigmoid = nn.Sigmoid()
@@ -84,7 +137,7 @@ class SpatialAttention(nn.Module):
 
 class CBAM(nn.Module):
     def __init__(self, in_planes, ratio=16, kernel_size=7):
-        super().__init__()
+        super(CBAM, self).__init__()
         self.ca = ChannelAttention(in_planes, ratio)
         self.sa = SpatialAttention(kernel_size)
     def forward(self, x):
@@ -92,84 +145,55 @@ class CBAM(nn.Module):
         x = x * self.sa(x)
         return x
 
-class VGG16WithCBAM(nn.Module):
-    def __init__(self, num_classes, pretrained=True):
-        super().__init__()
-        vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None)
-        self.features = vgg16.features   # -> [B, 512, 7, 7]
-        self.cbam = CBAM(in_planes=512)
-        self.avgpool = vgg16.avgpool     # AdaptiveAvgPool2d((7, 7))
+def _effnet_feature_dim(ver: str) -> int:
+    if ver == "b0": return 1280
+    if ver == "b1": return 1280
+    if ver == "b2": return 1408
+    if ver == "b3": return 1536
+    raise ValueError(f"Unsupported EfficientNet version: {ver}")
+
+def _effnet_backbone(ver: str, pretrained: bool = True):
+    if ver == "b0":
+        return models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
+    if ver == "b1":
+        return models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.DEFAULT if pretrained else None)
+    if ver == "b2":
+        return models.efficientnet_b2(weights=models.EfficientNet_B2_Weights.DEFAULT if pretrained else None)
+    if ver == "b3":
+        return models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT if pretrained else None)
+    raise ValueError(f"Unsupported EfficientNet version: {ver}")
+
+class EfficientNetWithCBAM(nn.Module):
+    """
+    EfficientNet backbone + CBAM pada feature map terakhir + GAP + linear head.
+    Disediakan juga alias atribut 'avgpool' -> 'avg_pool' agar state_dict lama yang
+    menyimpan kunci 'avgpool' tetap kompatibel.
+    """
+    def __init__(self, num_classes, efficientnet_version='b0', pretrained=True):
+        super(EfficientNetWithCBAM, self).__init__()
+        self.efficientnet_version = efficientnet_version
+        self.efficientnet = _effnet_backbone(efficientnet_version, pretrained=pretrained)
+        feature_dim = _effnet_feature_dim(efficientnet_version)
+
+        # gunakan feature extractor resmi dari torchvision
+        self.features = self.efficientnet.features  # -> [B, C, H, W]
+        self.cbam = CBAM(feature_dim)
+
+        # pooling & head
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.avgpool = self.avg_pool  # alias untuk kompatibilitas state_dict ('avgpool' expected)
         self.classifier = nn.Sequential(
-            nn.Linear(512 * 7 * 7, 4096),
-            nn.ReLU(True), nn.Dropout(0.5),
-            nn.Linear(4096, 4096),
-            nn.ReLU(True), nn.Dropout(0.5),
-            nn.Linear(4096, num_classes)
+            nn.Dropout(0.2),
+            nn.Linear(feature_dim, num_classes)
         )
+
     def forward(self, x):
         x = self.features(x)
         x = self.cbam(x)
-        x = self.avgpool(x)
+        x = self.avg_pool(x)
         x = torch.flatten(x, 1)
         x = self.classifier(x)
         return x
-
-# ============================
-# === Global Config & Paths ==
-# ============================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(APP_DIR, "model")
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-# --- helper untuk baca secrets/env dengan aman ---
-def _get_secret_like(keys, default=""):
-    """
-    Ambil dari:
-    - st.secrets["KEY"]
-    - st.secrets["model"]["KEY"] / st.secrets["MODEL"]["KEY"]
-    - ENV var os.environ["KEY"]
-    """
-    val = None
-    for k in keys:
-        try:
-            v = st.secrets[k]
-            if isinstance(v, str):
-                val = v
-                break
-        except Exception:
-            pass
-        try:
-            tbl = st.secrets.get("model", {}) or st.secrets.get("MODEL", {})
-            if isinstance(tbl, dict) and k in tbl and isinstance(tbl[k], str):
-                val = tbl[k]
-                break
-        except Exception:
-            pass
-        v = os.environ.get(k)
-        if v is not None:
-            val = v
-            break
-    return (val.strip() if isinstance(val, str) else default)
-
-# BACA dari secrets/env (robust)
-MODEL_URL        = _get_secret_like(["MODEL_URL"], "")
-GDRIVE_FILE_ID   = _get_secret_like(["GDRIVE_FILE_ID", "GOOGLE_DRIVE_FILE_ID"], "")
-LOCAL_MODEL_NAME = _get_secret_like(["LOCAL_MODEL_NAME"], "rice_model.ts")  # .ts/.pt (TorchScript) atau .pth (state_dict)
-
-# Path lokal untuk menyimpan cache file bobot yang diunduh
-LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, LOCAL_MODEL_NAME)
-
-# Panel debug aman (tidak menampilkan nilai sensitif)
-with st.expander("⚙️ Model config (debug aman)"):
-    dbg = {
-        "has_MODEL_URL": bool(MODEL_URL),
-        "has_GDRIVE_FILE_ID": bool(GDRIVE_FILE_ID),
-        "LOCAL_MODEL_NAME": LOCAL_MODEL_NAME,
-        "MODEL_DIR_exists": os.path.isdir(MODEL_DIR),
-        "LOCAL_MODEL_exists": os.path.isfile(LOCAL_MODEL_PATH),
-        "LOCAL_MODEL_size_bytes": os.path.getsize(LOCAL_MODEL_PATH) if os.path.isfile(LOCAL_MODEL_PATH) else 0,
-    }
-    st.code(dbg, language="python")
 
 # ===========================
 # === Downloading helpers ===
@@ -183,14 +207,10 @@ def _download_from_url(url: str, dst: str, chunk=8 * 1024 * 1024):
                     f.write(blob)
 
 def _download_from_gdrive(file_id: str, dst: str):
-    """
-    Download file besar dari Google Drive (Anyone-with-link) dengan token konfirmasi.
-    """
     session = requests.Session()
     base = "https://docs.google.com/uc?export=download"
     params = {"id": file_id}
 
-    # Step-1: request awal untuk cek token
     with session.get(base, params=params, stream=True, timeout=60) as r1:
         r1.raise_for_status()
         token = None
@@ -205,7 +225,6 @@ def _download_from_gdrive(file_id: str, dst: str):
                         f.write(chunk)
             return
 
-    # Step-2: request ulang dengan token konfirmasi
     params["confirm"] = token
     with session.get(base, params=params, stream=True, timeout=60) as r2:
         r2.raise_for_status()
@@ -215,20 +234,15 @@ def _download_from_gdrive(file_id: str, dst: str):
                     f.write(chunk)
 
 def _ensure_model_local():
-    """
-    Pastikan model tersedia lokal & valid (>1KB). Jika belum, unduh dari URL/GDrive.
-    """
+    """Pastikan bobot ada lokal; bila belum, unduh dari URL/GDrive."""
     if os.path.exists(LOCAL_MODEL_PATH) and os.path.isfile(LOCAL_MODEL_PATH):
         if os.path.getsize(LOCAL_MODEL_PATH) > 1024:
             return
 
     if not MODEL_URL and not GDRIVE_FILE_ID:
         raise RuntimeError(
-            "MODEL_URL atau GDRIVE_FILE_ID tidak ditemukan. "
-            "Isi di Settings → Secrets. Contoh:\n"
-            "GDRIVE_FILE_ID=\"FILE_ID\"  |  LOCAL_MODEL_NAME=\"rice_model.ts\"\n"
-            "atau\n"
-            "MODEL_URL=\"https://.../uc?export=download&id=FILE_ID\""
+            "MODEL_URL atau GDRIVE_FILE_ID tidak ditemukan di Secrets.\n"
+            "Isi salah satu dan set juga LOCAL_MODEL_NAME (ekstensi .ts/.pt/.pth)."
         )
 
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -240,8 +254,7 @@ def _ensure_model_local():
             _download_from_gdrive(GDRIVE_FILE_ID, tmp_path)
 
         if os.path.getsize(tmp_path) <= 1024:
-            raise EOFError("Download gagal/terpotong: ukuran <= 1KB (periksa link/permission).")
-
+            raise EOFError("Download gagal/terpotong (<=1KB). Periksa link/permission.")
         shutil.move(tmp_path, LOCAL_MODEL_PATH)
     finally:
         if os.path.exists(tmp_path):
@@ -251,12 +264,8 @@ def _ensure_model_local():
 # ==============================
 # === FULL-pickle compatibility =
 # ==============================
-# Jika file .pth ternyata FULL model dengan kelas "EfficientNetWithCBAM",
-# daftarkan alias agar unpickler bisa menemukannya (map ke VGG16WithCBAM).
-class EfficientNetWithCBAM(VGG16WithCBAM):
-    def __init__(self, num_classes=NUM_CLASSES, pretrained=False):
-        super().__init__(num_classes=num_classes, pretrained=pretrained)
-
+# Jika .pth adalah FULL model yang menyebut kelas 'EfficientNetWithCBAM',
+# pastikan unpickler menemukan kelas tersebut.
 def _register_class_aliases(alias_cls, names=("__main__", "main", "app", "models.efficientnet_cbam")):
     for mod_name in names:
         mod = sys.modules.get(mod_name) or types.ModuleType(mod_name)
@@ -278,14 +287,22 @@ class _pickle_mod:
 # ==============================
 # === Model loading (robust) ===
 # ==============================
+def _input_size_for_effnet(ver: str) -> int:
+    # ukuran input default torchvision: b0/b1=224, b2=260, b3=300
+    if ver == "b0" or ver == "b1": return 224
+    if ver == "b2": return 260
+    if ver == "b3": return 300
+    return 224
+
 @st.cache_resource(show_spinner=False)
-def load_model():
+def load_model_and_preprocess():
     """
     Urutan:
     1) Pastikan file ada (download kalau perlu)
-    2) Jika ekstensi .ts/.pt -> TorchScript via torch.jit.load
-    3) Jika ekstensi .pth -> coba (a) state_dict, (b) FULL pickle (dengan alias)
-    4) Fallback: pakai VGG16WithCBAM pretrained ImageNet
+    2) TorchScript (.ts/.pt) → jit.load
+    3) .pth → coba state_dict → coba FULL pickle
+    4) Fallback: EfficientNetWithCBAM pretrained
+    Return: (model.eval(), preprocess_transforms)
     """
     try:
         _ensure_model_local()
@@ -294,73 +311,112 @@ def load_model():
         if LOCAL_MODEL_NAME.lower().endswith((".ts", ".pt")):
             m = torch.jit.load(LOCAL_MODEL_PATH, map_location="cpu")
             m.eval()
-            return m
+            # coba tebak ukuran dari secret
+            sz = _input_size_for_effnet(EFFNET_VER)
+            preprocess = transforms.Compose([
+                transforms.Resize((sz, sz)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
+            ])
+            return m, preprocess
 
-        # .pth → coba state_dict dulu
+        # .pth → state_dict?
         if LOCAL_MODEL_NAME.lower().endswith(".pth"):
             try:
                 sd = torch.load(LOCAL_MODEL_PATH, map_location="cpu")
                 if isinstance(sd, dict) and any(isinstance(v, torch.Tensor) for v in sd.values()):
+                    # dukung {"state_dict": ...}
                     if "state_dict" in sd and isinstance(sd["state_dict"], dict):
                         sd = sd["state_dict"]
+                    # strip prefix umum
                     new_sd = {}
                     for k, v in sd.items():
                         for pref in ("module.", "model.", "net."):
                             if k.startswith(pref):
                                 k = k[len(pref):]
+                        # kompabilitas kunci 'avgpool' -> 'avg_pool'
+                        if k.startswith("avgpool"):
+                            k = k.replace("avgpool", "avg_pool", 1)
                         new_sd[k] = v
-                    model = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=False)
-                    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+
+                    m = EfficientNetWithCBAM(num_classes=NUM_CLASSES, efficientnet_version=EFFNET_VER, pretrained=False)
+                    missing, unexpected = m.load_state_dict(new_sd, strict=False)
                     if missing:  print("[load_model] missing:", missing)
                     if unexpected: print("[load_model] unexpected:", unexpected)
-                    model.eval()
-                    return model
-                # Kalau bukan dict → mungkin FULL model; lanjut ke blok berikut
-            except Exception as e_sd:
-                # lanjut coba FULL pickle dengan remapper
+                    m.eval()
+                    sz = _input_size_for_effnet(EFFNET_VER)
+                    preprocess = transforms.Compose([
+                        transforms.Resize((sz, sz)),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225]),
+                    ])
+                    return m, preprocess
+            except Exception:
                 pass
 
-            # Coba FULL pickle (normal → remap)
+            # FULL pickle?
             try:
                 m = torch.load(LOCAL_MODEL_PATH, map_location="cpu")
                 if isinstance(m, nn.Module):
+                    # beri alias avgpool jika perlu
+                    if hasattr(m, "avg_pool") and not hasattr(m, "avgpool"):
+                        setattr(m, "avgpool", m.avg_pool)
                     m.eval()
-                    return m
+                    sz = _input_size_for_effnet(EFFNET_VER)
+                    preprocess = transforms.Compose([
+                        transforms.Resize((sz, sz)),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225]),
+                    ])
+                    return m, preprocess
             except Exception:
                 pass
+
             try:
                 with open(LOCAL_MODEL_PATH, "rb") as f:
                     m = torch.load(f, map_location="cpu", pickle_module=_pickle_mod)
                 if isinstance(m, nn.Module):
+                    if hasattr(m, "avg_pool") and not hasattr(m, "avgpool"):
+                        setattr(m, "avgpool", m.avg_pool)
                     m.eval()
-                    return m
+                    sz = _input_size_for_effnet(EFFNET_VER)
+                    preprocess = transforms.Compose([
+                        transforms.Resize((sz, sz)),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225]),
+                    ])
+                    return m, preprocess
             except Exception as e_full:
                 raise RuntimeError(f"Gagal load .pth sebagai state_dict maupun FULL model. Detail: {e_full}")
 
-        # format tak dikenali → error
         raise RuntimeError(
             f"Format model tidak dikenali dari LOCAL_MODEL_NAME='{LOCAL_MODEL_NAME}'. "
             f"Gunakan .ts/.pt (TorchScript) atau .pth (state_dict/FULL)."
         )
 
     except Exception as e:
-        st.warning(f"[Fallback] Memakai VGG16WithCBAM pretrained ImageNet. Detail: {e}")
-        m = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=True)
+        st.warning(f"[Fallback] Memakai EfficientNetWithCBAM pretrained ({EFFNET_VER}). Detail: {e}")
+        m = EfficientNetWithCBAM(num_classes=NUM_CLASSES, efficientnet_version=EFFNET_VER, pretrained=True)
         with torch.no_grad():
-            m.classifier[-1] = nn.Linear(4096, NUM_CLASSES)
+            # head sudah 5 kelas, biarkan
+            pass
         m.eval()
-        return m
+        sz = _input_size_for_effnet(EFFNET_VER)
+        preprocess = transforms.Compose([
+            transforms.Resize((sz, sz)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+        return m, preprocess
 
 # =========================
 # === Pre/Post Processing ==
 # =========================
-_preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
-
 def is_rice_image(image: Image.Image) -> bool:
     img = np.array(image.convert('RGB'))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -431,19 +487,18 @@ def is_rice_image(image: Image.Image) -> bool:
     return True
 
 def predict_rice_quality(image: Image.Image):
-    model = load_model()
+    model, preprocess = load_model_and_preprocess()
     if model is None:
         return None
 
     pil_img = image.convert("RGB")
-    x = _preprocess(pil_img).unsqueeze(0)  # [1,C,H,W]
+    x = preprocess(pil_img).unsqueeze(0)  # [1,C,H,W]
 
     with torch.no_grad():
         logits = model(x)
-        if logits.ndim != 2 or logits.size(1) != NUM_CLASSES:
+        if not (isinstance(logits, torch.Tensor) and logits.ndim == 2 and logits.size(1) == NUM_CLASSES):
             raise RuntimeError(
-                f"Model output shape {tuple(logits.shape)} tidak sesuai NUM_CLASSES={NUM_CLASSES}. "
-                "Pastikan checkpoint & arsitektur sama."
+                f"Model output shape {tuple(getattr(logits, 'shape', 'UNKNOWN'))} tidak sesuai NUM_CLASSES={NUM_CLASSES}."
             )
         probs = F.softmax(logits, dim=1)
         idx = int(torch.argmax(probs, dim=1).item())
