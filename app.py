@@ -149,82 +149,116 @@ def _check_model_file(path):
 NUM_CLASSES = 5
 CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
 
-# ==== PATCH: robust FULL .pth loader ====
-# 1) PASTIKAN alias class ADA di semua jalur modul yang mungkin
-#    (saat model disave, modulnya bisa bernama '__main__', 'main', 'app', atau paket lain)
-def _register_class_aliases(alias_cls, names=("__main__", "main", "app", "models.efficientnet_cbam")):
-    for mod_name in names:
-        mod = sys.modules.get(mod_name)
-        if mod is None:
-            mod = types.ModuleType(mod_name)
-            sys.modules[mod_name] = mod
-        setattr(mod, "EfficientNetWithCBAM", alias_cls)
-
-# Alias: arahkan nama lama ke arsitektur yang kamu miliki
+# Alias agar FULL pickle dengan nama kelas lama tetap bisa dibuka
 class EfficientNetWithCBAM(VGG16WithCBAM):
     def __init__(self, num_classes=5, pretrained=False):
         super().__init__(num_classes=num_classes, pretrained=pretrained)
 
+def _register_class_aliases(alias_cls, names=("__main__", "main", "app", "models.efficientnet_cbam")):
+    for mod_name in names:
+        mod = sys.modules.get(mod_name) or types.ModuleType(mod_name)
+        sys.modules[mod_name] = mod
+        setattr(mod, "EfficientNetWithCBAM", alias_cls)
+
 _register_class_aliases(EfficientNetWithCBAM)
 
-# 2) FALLBACK: paksa unpickler memetakan nama kelas lama -> kelas baru
 class _RemapUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        # paksa semua referensi ke EfficientNetWithCBAM kembali ke kelas yang tersedia
         if name == "EfficientNetWithCBAM":
             return EfficientNetWithCBAM
         return super().find_class(module, name)
 
-# “pickle module” custom untuk torch.load
 class _pickle_mod:
     Unpickler = _RemapUnpickler
     loads = pickle.loads
 
-# 3) Loader robust: coba normal → jika gagal, gunakan remap unpickler.
-def _load_full_model_robust(path):
-    # a) coba cara biasa (kalau alias modul sudah match, ini langsung berhasil)
+def _try_load_torchscript(path):
+    try:
+        return torch.jit.load(path, map_location="cpu")
+    except Exception:
+        return None
+
+def _try_load_full_pickle(path):
     try:
         return torch.load(path, map_location="cpu")
-    except Exception as e1:
-        # b) fallback pakai unpickler remap
-        try:
-            with open(path, "rb") as f:
-                return torch.load(f, map_location="cpu", pickle_module=_pickle_mod)
-        except Exception as e2:
-            raise RuntimeError(
-                f"Gagal unpickle FULL model. Normal err: {e1}; Fallback err: {e2}"
-            )
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            return torch.load(f, map_location="cpu", pickle_module=_pickle_mod)
+    except Exception:
+        return None
+
+def _load_any_pytorch_checkpoint(path):
+    _check_model_file(path)  # ← CEK FILE DULU (mencegah Ran out of input)
+
+    # 1) TorchScript?
+    m = _try_load_torchscript(path)
+    if isinstance(m, (torch.jit.ScriptModule, torch.jit.RecursiveScriptModule, nn.Module)):
+        return m
+
+    # 2) FULL pickle?
+    m = _try_load_full_pickle(path)
+    if isinstance(m, nn.Module):
+        return m
+
+    # 3) state_dict?
+    try:
+        sd = torch.load(path, map_location="cpu")
+        if isinstance(sd, dict) and any(isinstance(v, torch.Tensor) for v in sd.values()):
+            model = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=False)
+            def _strip_prefix(d):
+                out = {}
+                for k, v in d.items():
+                    for p in ("module.", "model.", "net."):
+                        if k.startswith(p): k = k[len(p):]
+                    out[k] = v
+                return out
+            sd = sd.get("state_dict", sd)
+            sd = _strip_prefix(sd)
+            model.load_state_dict(sd, strict=False)
+            return model
+    except Exception:
+        pass
+
+    raise RuntimeError("File bukan TorchScript, bukan FULL pickle, dan bukan state_dict.")
+
 
 # Function to load the model
 @st.cache_resource(show_spinner=False)
 def load_model():
-    if not os.path.exists(MODEL_PATH):
-        st.error(f"Model not found at {MODEL_PATH}")
-        return None
-
     try:
-        model = _load_full_model_robust(MODEL_PATH)  # ← gunakan loader robust
-        if not isinstance(model, nn.Module):
-            raise TypeError("Loaded object is not an nn.Module. Apakah ini state_dict?")
-        model.eval()
-
-        # (SANGAT DISARANKAN) simpan dalam format state_dict sekali saja agar ke depan stabil
+        model = _load_any_pytorch_checkpoint(MODEL_PATH)
+        # normalisasi ke eval
+        if hasattr(model, "eval"):
+            model.eval()
+        # Simpan sekali sebagai state_dict agar deploy berikutnya stabil
         try:
-            safe_out = os.path.splitext(MODEL_PATH)[0] + "_state.pth"
-            torch.save(model.state_dict(), safe_out)
-            print(f"[INFO] Disimpan juga sebagai state_dict: {safe_out}")
+            if isinstance(model, nn.Module) and not isinstance(model, (torch.jit.ScriptModule, torch.jit.RecursiveScriptModule)):
+                safe_out = os.path.splitext(MODEL_PATH)[0] + "_state.pth"
+                torch.save(model.state_dict(), safe_out)
+                print(f"[INFO] Disimpan juga sebagai state_dict: {safe_out}")
         except Exception:
             pass
-
         return model
     except Exception as e:
+        size = os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) and os.path.isfile(MODEL_PATH) else -1
+        # tampilkan isi folder untuk memastikan bundling file di container/streamlit
+        try:
+            listing = os.listdir(os.path.dirname(MODEL_PATH))
+        except Exception:
+            listing = []
         st.error(
-            "Gagal memuat FULL model (.pth). "
-            "Jika error bertuliskan `Can't get attribute 'EfficientNetWithCBAM'`, "
-            "pastikan kelas tersebut tersedia. "
-            f"Detail: {e}"
+            "Gagal memuat model.\n\n"
+            f"- Path  : {MODEL_PATH}\n"
+            f"- Ukuran: {size} bytes\n"
+            f"- Folder: {listing}\n"
+            f"- Detail: {e}\n\n"
+            "Periksa bahwa file ada, bukan folder, dan tidak 0 byte. "
+            "Jika ini TorchScript, simpan dengan `torch.jit.save` dan muat via `torch.jit.load`."
         )
         return None
+
         
 _preprocess = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -460,6 +494,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
