@@ -226,38 +226,20 @@ def _load_any_pytorch_checkpoint(path):
 
 # Function to load the model
 @st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_model():
     try:
-        model = _load_any_pytorch_checkpoint(MODEL_PATH)
-        # normalisasi ke eval
-        if hasattr(model, "eval"):
-            model.eval()
-        # Simpan sekali sebagai state_dict agar deploy berikutnya stabil
-        try:
-            if isinstance(model, nn.Module) and not isinstance(model, (torch.jit.ScriptModule, torch.jit.RecursiveScriptModule)):
-                safe_out = os.path.splitext(MODEL_PATH)[0] + "_state.pth"
-                torch.save(model.state_dict(), safe_out)
-                print(f"[INFO] Disimpan juga sebagai state_dict: {safe_out}")
-        except Exception:
-            pass
-        return model
+        # pastikan file bener2 ada & >1KB
+        _check_model_file(MODEL_PATH)
+        return _load_any_pytorch_checkpoint(MODEL_PATH).eval()
     except Exception as e:
-        size = os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) and os.path.isfile(MODEL_PATH) else -1
-        # tampilkan isi folder untuk memastikan bundling file di container/streamlit
-        try:
-            listing = os.listdir(os.path.dirname(MODEL_PATH))
-        except Exception:
-            listing = []
-        st.error(
-            "Gagal memuat model.\n\n"
-            f"- Path  : {MODEL_PATH}\n"
-            f"- Ukuran: {size} bytes\n"
-            f"- Folder: {listing}\n"
-            f"- Detail: {e}\n\n"
-            "Periksa bahwa file ada, bukan folder, dan tidak 0 byte. "
-            "Jika ini TorchScript, simpan dengan `torch.jit.save` dan muat via `torch.jit.load`."
-        )
-        return None
+        st.warning(f"[Fallback] Memakai VGG16WithCBAM pretrained ImageNet. Detail: {e}")
+        m = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=True)
+        # re-init classifier agar 5 kelas
+        with torch.no_grad():
+            m.classifier[-1] = nn.Linear(4096, NUM_CLASSES)
+        m.eval()
+        return m
 
         
 _preprocess = transforms.Compose([
@@ -494,6 +476,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
