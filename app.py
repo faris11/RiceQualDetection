@@ -6,6 +6,7 @@ from PIL import Image
 import io
 import os
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torchvision import transforms
@@ -387,6 +388,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
