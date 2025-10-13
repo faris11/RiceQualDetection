@@ -117,14 +117,62 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "model")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Ambil parameter dari Secrets
-MODEL_URL = st.secrets.get("MODEL_URL", "")          # opsi A: URL langsung
-GDRIVE_FILE_ID = st.secrets.get("GDRIVE_FILE_ID", "")# opsi B: File ID Google Drive
-LOCAL_MODEL_NAME = st.secrets.get("LOCAL_MODEL_NAME", "efficientnet_cbam_6.pth")  # .ts (TorchScript) atau .pth (state_dict)
+# --- helper untuk baca secrets/env dengan aman ---
+def _get_secret_like(keys, default=""):
+    """
+    Coba ambil nilai dari beberapa kemungkinan lokasi:
+    - st.secrets["KEY"]
+    - st.secrets["model"]["KEY"]  (kalau kamu pakai table [model] di secrets.toml)
+    - ENV var os.environ["KEY"]
+    Return string yang sudah .strip()
+    """
+    val = None
+    for k in keys:
+        # 1) root secrets
+        try:
+            v = st.secrets[k]
+            if isinstance(v, str):
+                val = v
+                break
+        except Exception:
+            pass
+        # 2) table [model] atau [MODEL]
+        try:
+            tbl = st.secrets.get("model", {}) or st.secrets.get("MODEL", {})
+            if isinstance(tbl, dict) and k in tbl and isinstance(tbl[k], str):
+                val = tbl[k]
+                break
+        except Exception:
+            pass
+        # 3) ENV
+        v = os.environ.get(k)
+        if v is not None:
+            val = v
+            break
+    if val is None:
+        return default
+    return val.strip()
+
+# BACA dari secrets/env (robust)
+MODEL_URL        = _get_secret_like(["MODEL_URL"], "")
+GDRIVE_FILE_ID   = _get_secret_like(["GDRIVE_FILE_ID", "GOOGLE_DRIVE_FILE_ID"], "")
+LOCAL_MODEL_NAME = _get_secret_like(["LOCAL_MODEL_NAME"], "rice_model.ts")  # .ts/.pt (TorchScript) atau .pth (state_dict)
+
+# Path lokal untuk menyimpan cache file bobot yang diunduh
 LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, LOCAL_MODEL_NAME)
 
-NUM_CLASSES = 5
-CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
+# Panel debug aman (tidak menampilkan nilai sensitif)
+with st.expander("⚙️ Model config (debug aman)"):
+    dbg = {
+        "has_MODEL_URL": bool(MODEL_URL),
+        "has_GDRIVE_FILE_ID": bool(GDRIVE_FILE_ID),
+        "LOCAL_MODEL_NAME": LOCAL_MODEL_NAME,
+        "MODEL_DIR_exists": os.path.isdir(MODEL_DIR),
+        "LOCAL_MODEL_exists": os.path.isfile(LOCAL_MODEL_PATH),
+        "LOCAL_MODEL_size_bytes": os.path.getsize(LOCAL_MODEL_PATH) if os.path.isfile(LOCAL_MODEL_PATH) else 0,
+    }
+    st.code(dbg, language="python")
+
 
 # ===========================
 # === Downloading helpers ===
@@ -178,17 +226,29 @@ def _ensure_model_local():
         if os.path.getsize(LOCAL_MODEL_PATH) > 1024:
             return
 
+    # Validasi sumber unduhan
+    if not MODEL_URL and not GDRIVE_FILE_ID:
+        raise RuntimeError(
+            "MODEL_URL atau GDRIVE_FILE_ID tidak ditemukan. "
+            "Buka Settings → Secrets dan isi salah satu:\n"
+            "MODEL_URL = \"https://.../uc?export=download&id=FILE_ID\"\n"
+            "LOCAL_MODEL_NAME = \"rice_model.ts\"  # atau .pth\n"
+            "ATAU\n"
+            "GDRIVE_FILE_ID = \"FILE_ID\"\n"
+            "LOCAL_MODEL_NAME = \"rice_model.ts\""
+        )
+
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp_path = tmp.name
     try:
         if MODEL_URL:
             _download_from_url(MODEL_URL, tmp_path)
-        elif GDRIVE_FILE_ID:
-            _download_from_gdrive(GDRIVE_FILE_ID, tmp_path)
         else:
-            raise RuntimeError("MODEL_URL atau GDRIVE_FILE_ID belum di-set di Secrets.")
+            _download_from_gdrive(GDRIVE_FILE_ID, tmp_path)
+
         if os.path.getsize(tmp_path) <= 1024:
-            raise EOFError("Download gagal/terpotong: ukuran <= 1KB")
+            raise EOFError("Download gagal/terpotong: ukuran <= 1KB (periksa link/permission).")
+
         shutil.move(tmp_path, LOCAL_MODEL_PATH)
     finally:
         if os.path.exists(tmp_path):
@@ -207,6 +267,7 @@ st.caption(f"[secrets-check] {dbg}")
 # ==============================
 # === Model loading (robust) ===
 # ==============================
+
 @st.cache_resource(show_spinner=False)
 def load_model():
     """
@@ -221,12 +282,9 @@ def load_model():
 
         # TorchScript?
         if LOCAL_MODEL_NAME.lower().endswith((".ts", ".pt")):
-            try:
-                m = torch.jit.load(LOCAL_MODEL_PATH, map_location="cpu")
-                m.eval()
-                return m
-            except Exception as e_ts:
-                st.warning(f"TorchScript load gagal, coba state_dict. Detail: {e_ts}")
+            m = torch.jit.load(LOCAL_MODEL_PATH, map_location="cpu")
+            m.eval()
+            return m
 
         # state_dict?
         if LOCAL_MODEL_NAME.lower().endswith(".pth"):
@@ -252,18 +310,21 @@ def load_model():
             model.eval()
             return model
 
-        # format tak dikenali → fallback
-        raise RuntimeError("Format model tidak dikenali (gunakan .ts TorchScript atau .pth state_dict).")
+        # format tak dikenali → error jelas
+        raise RuntimeError(
+            f"Format model tidak dikenali dari LOCAL_MODEL_NAME='{LOCAL_MODEL_NAME}'. "
+            f"Gunakan .ts/.pt (TorchScript) atau .pth (state_dict)."
+        )
 
     except Exception as e:
+        # Catatan: kalau kamu ingin *benar2* cegah fallback saat secrets hilang,
+        # ganti st.warning(...) menjadi st.error(...) lalu return None.
         st.warning(f"[Fallback] Memakai VGG16WithCBAM pretrained ImageNet. Detail: {e}")
         m = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=True)
-        # sesuaikan head ke 5 kelas agar aplikasimu jalan (meski inferensi belum akurat)
         with torch.no_grad():
             m.classifier[-1] = nn.Linear(4096, NUM_CLASSES)
         m.eval()
         return m
-
 
 # =========================
 # === Pre/Post Processing ==
@@ -433,5 +494,6 @@ st.markdown("""
     <p>© 2023 Rice Quality Detection System</p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
