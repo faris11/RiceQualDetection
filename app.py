@@ -132,24 +132,84 @@ except Exception:
 MODEL_PATH = "model/efficientnet_cbam_6.pth"   # ganti sesuai lokasi .pth Anda
 NUM_CLASSES = 5
 CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
-    
+
+# ==== PATCH: robust FULL .pth loader ====
+import sys, types, pickle, os
+import torch
+import torch.nn as nn
+
+# 1) PASTIKAN alias class ADA di semua jalur modul yang mungkin
+#    (saat model disave, modulnya bisa bernama '__main__', 'main', 'app', atau paket lain)
+def _register_class_aliases(alias_cls, names=("__main__", "main", "app", "models.efficientnet_cbam")):
+    for mod_name in names:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            mod = types.ModuleType(mod_name)
+            sys.modules[mod_name] = mod
+        setattr(mod, "EfficientNetWithCBAM", alias_cls)
+
+# Alias: arahkan nama lama ke arsitektur yang kamu miliki
+class EfficientNetWithCBAM(VGG16WithCBAM):
+    def __init__(self, num_classes=5, pretrained=False):
+        super().__init__(num_classes=num_classes, pretrained=pretrained)
+
+_register_class_aliases(EfficientNetWithCBAM)
+
+# 2) FALLBACK: paksa unpickler memetakan nama kelas lama -> kelas baru
+class _RemapUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        # paksa semua referensi ke EfficientNetWithCBAM kembali ke kelas yang tersedia
+        if name == "EfficientNetWithCBAM":
+            return EfficientNetWithCBAM
+        return super().find_class(module, name)
+
+# “pickle module” custom untuk torch.load
+class _pickle_mod:
+    Unpickler = _RemapUnpickler
+    loads = pickle.loads
+
+# 3) Loader robust: coba normal → jika gagal, gunakan remap unpickler.
+def _load_full_model_robust(path):
+    # a) coba cara biasa (kalau alias modul sudah match, ini langsung berhasil)
+    try:
+        return torch.load(path, map_location="cpu")
+    except Exception as e1:
+        # b) fallback pakai unpickler remap
+        try:
+            with open(path, "rb") as f:
+                return torch.load(f, map_location="cpu", pickle_module=_pickle_mod)
+        except Exception as e2:
+            raise RuntimeError(
+                f"Gagal unpickle FULL model. Normal err: {e1}; Fallback err: {e2}"
+            )
+
 # Function to load the model
 @st.cache_resource(show_spinner=False)
 def load_model():
     if not os.path.exists(MODEL_PATH):
         st.error(f"Model not found at {MODEL_PATH}")
         return None
+
     try:
-        model = torch.load(MODEL_PATH, map_location="cpu")  # unpickle full model
-        if not isinstance(model, torch.nn.Module):
-            raise TypeError("Loaded object is not an nn.Module. Did you save a state_dict instead?")
+        model = _load_full_model_robust(MODEL_PATH)  # ← gunakan loader robust
+        if not isinstance(model, nn.Module):
+            raise TypeError("Loaded object is not an nn.Module. Apakah ini state_dict?")
         model.eval()
+
+        # (SANGAT DISARANKAN) simpan dalam format state_dict sekali saja agar ke depan stabil
+        try:
+            safe_out = os.path.splitext(MODEL_PATH)[0] + "_state.pth"
+            torch.save(model.state_dict(), safe_out)
+            print(f"[INFO] Disimpan juga sebagai state_dict: {safe_out}")
+        except Exception:
+            pass
+
         return model
     except Exception as e:
         st.error(
             "Gagal memuat FULL model (.pth). "
             "Jika error bertuliskan `Can't get attribute 'EfficientNetWithCBAM'`, "
-            "pastikan kelas tersebut di-import/terdefinisi di file ini. "
+            "pastikan kelas tersebut tersedia. "
             f"Detail: {e}"
         )
         return None
@@ -388,6 +448,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
