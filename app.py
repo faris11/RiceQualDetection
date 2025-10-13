@@ -195,6 +195,14 @@ def _ensure_model_local():
             try: os.remove(tmp_path)
             except Exception: pass
 
+#verifikasi secret
+dbg = {
+    "has_MODEL_URL": bool(st.secrets.get("MODEL_URL")),
+    "has_GDRIVE_FILE_ID": bool(st.secrets.get("GDRIVE_FILE_ID")),
+    "LOCAL_MODEL_NAME": st.secrets.get("LOCAL_MODEL_NAME", None),
+}
+st.caption(f"[secrets-check] {dbg}")
+
 
 # ==============================
 # === Model loading (robust) ===
@@ -425,4 +433,5 @@ st.markdown("""
     <p>© 2023 Rice Quality Detection System</p>
 </div>
 """, unsafe_allow_html=True)
+
 
