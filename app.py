@@ -5,11 +5,15 @@ import tensorflow as tf
 from PIL import Image
 import io
 import os
+import sys, types, pickle
+import torch
+import torch.nn as nn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torchvision import transforms
+from torchvision import models
 
 # Set page configuration
 st.set_page_config(
@@ -128,16 +132,24 @@ try:
 except Exception:
     pass
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(APP_DIR, "model", "efficientnet_cbam_6.pth")  # sesuaikan nama file
+
+def _check_model_file(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint tidak ditemukan: {path}")
+    if not os.path.isfile(path):
+        raise IsADirectoryError(f"Checkpoint merujuk ke FOLDER, bukan FILE: {path}")
+    size = os.path.getsize(path)
+    if size < 1024:  # < 1KB hampir pasti bukan checkpoint PyTorch yang valid
+        raise EOFError(f"Checkpoint terlalu kecil ({size} bytes) — kemungkinan file kosong/korup.")
+        
 # Konfigurasi model
-MODEL_PATH = "model/efficientnet_cbam_6.pth"   # ganti sesuai lokasi .pth Anda
+#MODEL_PATH = "model/efficientnet_cbam_6.pth"   # ganti sesuai lokasi .pth Anda
 NUM_CLASSES = 5
 CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
 
 # ==== PATCH: robust FULL .pth loader ====
-import sys, types, pickle, os
-import torch
-import torch.nn as nn
-
 # 1) PASTIKAN alias class ADA di semua jalur modul yang mungkin
 #    (saat model disave, modulnya bisa bernama '__main__', 'main', 'app', atau paket lain)
 def _register_class_aliases(alias_cls, names=("__main__", "main", "app", "models.efficientnet_cbam")):
@@ -448,6 +460,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
