@@ -120,7 +120,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 # Ambil parameter dari Secrets
 MODEL_URL = st.secrets.get("MODEL_URL", "")          # opsi A: URL langsung
 GDRIVE_FILE_ID = st.secrets.get("GDRIVE_FILE_ID", "")# opsi B: File ID Google Drive
-LOCAL_MODEL_NAME = st.secrets.get("LOCAL_MODEL_NAME", "rice_model.ts")  # .ts (TorchScript) atau .pth (state_dict)
+LOCAL_MODEL_NAME = st.secrets.get("LOCAL_MODEL_NAME", "efficientnet_cbam_6.pth")  # .ts (TorchScript) atau .pth (state_dict)
 LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, LOCAL_MODEL_NAME)
 
 NUM_CLASSES = 5
@@ -425,3 +425,4 @@ st.markdown("""
     <p>© 2023 Rice Quality Detection System</p>
 </div>
 """, unsafe_allow_html=True)
+
