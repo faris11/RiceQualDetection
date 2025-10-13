@@ -54,6 +54,74 @@ st.markdown("""
 st.markdown("<h1 class='header'>Rice Quality Detection</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; margin-bottom: 2rem;'>Upload an image of rice to detect its quality.</p>", unsafe_allow_html=True)
 
+# --- definisi arsitektur kamu ---
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        return self.sigmoid(avg_out + max_out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+
+class VGG16WithCBAM(nn.Module):
+    def __init__(self, num_classes, pretrained=True):
+        super(VGG16WithCBAM, self).__init__()
+        vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None)
+        self.features = vgg16.features
+        self.cbam = CBAM(in_planes=512)
+        self.avgpool = vgg16.avgpool
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 7 * 7, 4096),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(4096, 4096),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(4096, num_classes)
+        )
+    def forward(self, x):
+        x = self.features(x)
+        x = self.cbam(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
+# --- ALIAS untuk memuaskan pickle ---
+class EfficientNetWithCBAM(VGG16WithCBAM):
+    """Dummy alias agar FULL model bisa dibuka"""
+    def __init__(self, num_classes=5, pretrained=False):
+        super().__init__(num_classes=num_classes, pretrained=pretrained)
+
 try:
     from models.efficientnet_cbam import EfficientNetWithCBAM as _EfficientNetWithCBAM
     setattr(sys.modules[__name__], 'EfficientNetWithCBAM', _EfficientNetWithCBAM)
@@ -223,74 +291,6 @@ def is_rice_image(image):
     
     #return predicted_class, confidence
 
-# --- definisi arsitektur kamu ---
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        return self.sigmoid(avg_out + max_out)
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        padding = 3 if kernel_size == 7 else 1
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-class CBAM(nn.Module):
-    def __init__(self, in_planes, ratio=16, kernel_size=7):
-        super(CBAM, self).__init__()
-        self.ca = ChannelAttention(in_planes, ratio)
-        self.sa = SpatialAttention(kernel_size)
-    def forward(self, x):
-        x = x * self.ca(x)
-        x = x * self.sa(x)
-        return x
-
-class VGG16WithCBAM(nn.Module):
-    def __init__(self, num_classes, pretrained=True):
-        super(VGG16WithCBAM, self).__init__()
-        vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None)
-        self.features = vgg16.features
-        self.cbam = CBAM(in_planes=512)
-        self.avgpool = vgg16.avgpool
-        self.classifier = nn.Sequential(
-            nn.Linear(512 * 7 * 7, 4096),
-            nn.ReLU(True),
-            nn.Dropout(0.5),
-            nn.Linear(4096, 4096),
-            nn.ReLU(True),
-            nn.Dropout(0.5),
-            nn.Linear(4096, num_classes)
-        )
-    def forward(self, x):
-        x = self.features(x)
-        x = self.cbam(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.classifier(x)
-        return x
-
-# --- ALIAS untuk memuaskan pickle ---
-class EfficientNetWithCBAM(VGG16WithCBAM):
-    """Dummy alias agar FULL model bisa dibuka"""
-    def __init__(self, num_classes=5, pretrained=False):
-        super().__init__(num_classes=num_classes, pretrained=pretrained)
-
 #Read model from PyTorch
 def predict_rice_quality(image):
     model = load_model()
@@ -388,6 +388,7 @@ st.markdown("""
 </div>
 
 """, unsafe_allow_html=True)
+
 
 
 
