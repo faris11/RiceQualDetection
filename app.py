@@ -46,6 +46,11 @@ st.markdown("""
 st.markdown("<h1 class='header'>Rice Quality Detection</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; margin-bottom: 2rem;'>Upload an image of rice to detect its quality.</p>", unsafe_allow_html=True)
 
+# ===============================
+# === Constants for inference ===
+# ===============================
+NUM_CLASSES = 5
+CLASS_NAMES = ["normal", "damage", "chalky", "broken", "discolored"]
 
 # ===================================
 # === Model Architecture (VGG+CBAM) ==
@@ -109,7 +114,6 @@ class VGG16WithCBAM(nn.Module):
         x = self.classifier(x)
         return x
 
-
 # ============================
 # === Global Config & Paths ==
 # ============================
@@ -120,15 +124,13 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 # --- helper untuk baca secrets/env dengan aman ---
 def _get_secret_like(keys, default=""):
     """
-    Coba ambil nilai dari beberapa kemungkinan lokasi:
+    Ambil dari:
     - st.secrets["KEY"]
-    - st.secrets["model"]["KEY"]  (kalau kamu pakai table [model] di secrets.toml)
+    - st.secrets["model"]["KEY"] / st.secrets["MODEL"]["KEY"]
     - ENV var os.environ["KEY"]
-    Return string yang sudah .strip()
     """
     val = None
     for k in keys:
-        # 1) root secrets
         try:
             v = st.secrets[k]
             if isinstance(v, str):
@@ -136,7 +138,6 @@ def _get_secret_like(keys, default=""):
                 break
         except Exception:
             pass
-        # 2) table [model] atau [MODEL]
         try:
             tbl = st.secrets.get("model", {}) or st.secrets.get("MODEL", {})
             if isinstance(tbl, dict) and k in tbl and isinstance(tbl[k], str):
@@ -144,14 +145,11 @@ def _get_secret_like(keys, default=""):
                 break
         except Exception:
             pass
-        # 3) ENV
         v = os.environ.get(k)
         if v is not None:
             val = v
             break
-    if val is None:
-        return default
-    return val.strip()
+    return (val.strip() if isinstance(val, str) else default)
 
 # BACA dari secrets/env (robust)
 MODEL_URL        = _get_secret_like(["MODEL_URL"], "")
@@ -172,7 +170,6 @@ with st.expander("⚙️ Model config (debug aman)"):
         "LOCAL_MODEL_size_bytes": os.path.getsize(LOCAL_MODEL_PATH) if os.path.isfile(LOCAL_MODEL_PATH) else 0,
     }
     st.code(dbg, language="python")
-
 
 # ===========================
 # === Downloading helpers ===
@@ -202,7 +199,6 @@ def _download_from_gdrive(file_id: str, dst: str):
                 token = v
                 break
         if token is None:
-            # mungkin file kecil; simpan langsung
             with open(dst, "wb") as f:
                 for chunk in r1.iter_content(8 * 1024 * 1024):
                     if chunk:
@@ -226,16 +222,13 @@ def _ensure_model_local():
         if os.path.getsize(LOCAL_MODEL_PATH) > 1024:
             return
 
-    # Validasi sumber unduhan
     if not MODEL_URL and not GDRIVE_FILE_ID:
         raise RuntimeError(
             "MODEL_URL atau GDRIVE_FILE_ID tidak ditemukan. "
-            "Buka Settings → Secrets dan isi salah satu:\n"
-            "MODEL_URL = \"https://.../uc?export=download&id=FILE_ID\"\n"
-            "LOCAL_MODEL_NAME = \"rice_model.ts\"  # atau .pth\n"
-            "ATAU\n"
-            "GDRIVE_FILE_ID = \"FILE_ID\"\n"
-            "LOCAL_MODEL_NAME = \"rice_model.ts\""
+            "Isi di Settings → Secrets. Contoh:\n"
+            "GDRIVE_FILE_ID=\"FILE_ID\"  |  LOCAL_MODEL_NAME=\"rice_model.ts\"\n"
+            "atau\n"
+            "MODEL_URL=\"https://.../uc?export=download&id=FILE_ID\""
         )
 
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -255,27 +248,44 @@ def _ensure_model_local():
             try: os.remove(tmp_path)
             except Exception: pass
 
-#verifikasi secret
-dbg = {
-    "has_MODEL_URL": bool(st.secrets.get("MODEL_URL")),
-    "has_GDRIVE_FILE_ID": bool(st.secrets.get("GDRIVE_FILE_ID")),
-    "LOCAL_MODEL_NAME": st.secrets.get("LOCAL_MODEL_NAME", None),
-}
-st.caption(f"[secrets-check] {dbg}")
+# ==============================
+# === FULL-pickle compatibility =
+# ==============================
+# Jika file .pth ternyata FULL model dengan kelas "EfficientNetWithCBAM",
+# daftarkan alias agar unpickler bisa menemukannya (map ke VGG16WithCBAM).
+class EfficientNetWithCBAM(VGG16WithCBAM):
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=False):
+        super().__init__(num_classes=num_classes, pretrained=pretrained)
 
+def _register_class_aliases(alias_cls, names=("__main__", "main", "app", "models.efficientnet_cbam")):
+    for mod_name in names:
+        mod = sys.modules.get(mod_name) or types.ModuleType(mod_name)
+        sys.modules[mod_name] = mod
+        setattr(mod, "EfficientNetWithCBAM", alias_cls)
+
+_register_class_aliases(EfficientNetWithCBAM)
+
+class _RemapUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if name == "EfficientNetWithCBAM":
+            return EfficientNetWithCBAM
+        return super().find_class(module, name)
+
+class _pickle_mod:
+    Unpickler = _RemapUnpickler
+    loads = pickle.loads
 
 # ==============================
 # === Model loading (robust) ===
 # ==============================
-
 @st.cache_resource(show_spinner=False)
 def load_model():
     """
     Urutan:
     1) Pastikan file ada (download kalau perlu)
     2) Jika ekstensi .ts/.pt -> TorchScript via torch.jit.load
-    3) Jika ekstensi .pth -> state_dict: build VGG16WithCBAM lalu load_state_dict
-    4) Fallback: pakai VGG16WithCBAM pretrained ImageNet (UI tetap hidup)
+    3) Jika ekstensi .pth -> coba (a) state_dict, (b) FULL pickle (dengan alias)
+    4) Fallback: pakai VGG16WithCBAM pretrained ImageNet
     """
     try:
         _ensure_model_local()
@@ -286,39 +296,54 @@ def load_model():
             m.eval()
             return m
 
-        # state_dict?
+        # .pth → coba state_dict dulu
         if LOCAL_MODEL_NAME.lower().endswith(".pth"):
-            sd = torch.load(LOCAL_MODEL_PATH, map_location="cpu")
-            if not (isinstance(sd, dict) and any(isinstance(v, torch.Tensor) for v in sd.values())):
-                raise TypeError("File .pth bukan state_dict yang berisi tensor.")
-            # dukung format {'state_dict': ...}
-            if "state_dict" in sd and isinstance(sd["state_dict"], dict):
-                sd = sd["state_dict"]
+            try:
+                sd = torch.load(LOCAL_MODEL_PATH, map_location="cpu")
+                if isinstance(sd, dict) and any(isinstance(v, torch.Tensor) for v in sd.values()):
+                    if "state_dict" in sd and isinstance(sd["state_dict"], dict):
+                        sd = sd["state_dict"]
+                    new_sd = {}
+                    for k, v in sd.items():
+                        for pref in ("module.", "model.", "net."):
+                            if k.startswith(pref):
+                                k = k[len(pref):]
+                        new_sd[k] = v
+                    model = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=False)
+                    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+                    if missing:  print("[load_model] missing:", missing)
+                    if unexpected: print("[load_model] unexpected:", unexpected)
+                    model.eval()
+                    return model
+                # Kalau bukan dict → mungkin FULL model; lanjut ke blok berikut
+            except Exception as e_sd:
+                # lanjut coba FULL pickle dengan remapper
+                pass
 
-            # strip prefix umum
-            new_sd = {}
-            for k, v in sd.items():
-                for pref in ("module.", "model.", "net."):
-                    if k.startswith(pref):
-                        k = k[len(pref):]
-                new_sd[k] = v
+            # Coba FULL pickle (normal → remap)
+            try:
+                m = torch.load(LOCAL_MODEL_PATH, map_location="cpu")
+                if isinstance(m, nn.Module):
+                    m.eval()
+                    return m
+            except Exception:
+                pass
+            try:
+                with open(LOCAL_MODEL_PATH, "rb") as f:
+                    m = torch.load(f, map_location="cpu", pickle_module=_pickle_mod)
+                if isinstance(m, nn.Module):
+                    m.eval()
+                    return m
+            except Exception as e_full:
+                raise RuntimeError(f"Gagal load .pth sebagai state_dict maupun FULL model. Detail: {e_full}")
 
-            model = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=False)
-            missing, unexpected = model.load_state_dict(new_sd, strict=False)
-            if missing:  print("[load_model] missing:", missing)
-            if unexpected: print("[load_model] unexpected:", unexpected)
-            model.eval()
-            return model
-
-        # format tak dikenali → error jelas
+        # format tak dikenali → error
         raise RuntimeError(
             f"Format model tidak dikenali dari LOCAL_MODEL_NAME='{LOCAL_MODEL_NAME}'. "
-            f"Gunakan .ts/.pt (TorchScript) atau .pth (state_dict)."
+            f"Gunakan .ts/.pt (TorchScript) atau .pth (state_dict/FULL)."
         )
 
     except Exception as e:
-        # Catatan: kalau kamu ingin *benar2* cegah fallback saat secrets hilang,
-        # ganti st.warning(...) menjadi st.error(...) lalu return None.
         st.warning(f"[Fallback] Memakai VGG16WithCBAM pretrained ImageNet. Detail: {e}")
         m = VGG16WithCBAM(num_classes=NUM_CLASSES, pretrained=True)
         with torch.no_grad():
@@ -405,7 +430,6 @@ def is_rice_image(image: Image.Image) -> bool:
                 return False
     return True
 
-
 def predict_rice_quality(image: Image.Image):
     model = load_model()
     if model is None:
@@ -427,7 +451,6 @@ def predict_rice_quality(image: Image.Image):
 
     label = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else str(idx)
     return label, conf
-
 
 # ====================
 # === Streamlit UI ===
@@ -494,6 +517,3 @@ st.markdown("""
     <p>© 2023 Rice Quality Detection System</p>
 </div>
 """, unsafe_allow_html=True)
-
-
-
